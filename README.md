@@ -2,6 +2,8 @@
 
 A desktop app for reading and writing RFID tags, built with Tauri + React. Communicates with an ESP32-S3 + PN532 reader over USB serial.
 
+![RFID Tool screenshot](screenshot.png)
+
 ## Features
 
 - Read and display full tag memory (pages/blocks) with hex and ASCII view
