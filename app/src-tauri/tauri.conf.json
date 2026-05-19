@@ -1,0 +1,28 @@
+{
+  "productName": "RFID Tool",
+  "version": "0.1.0",
+  "identifier": "com.rfid.tool",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:1420",
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "RFID Tool",
+        "width": 1050,
+        "height": 720,
+        "resizable": true,
+        "center": true
+      }
+    ],
+    "security": { "csp": null }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": ["icons/icon.ico", "icons/32x32.png", "icons/128x128.png"]
+  }
+}

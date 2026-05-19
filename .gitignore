@@ -1,0 +1,21 @@
+# ── Rust / Tauri ──────────────────────────────────────────────
+app/src-tauri/target/
+
+# ── Node ──────────────────────────────────────────────────────
+app/node_modules/
+app/dist/
+
+# ── OS ────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── IDEs ──────────────────────────────────────────────────────
+.vscode/settings.json
+.idea/
+*.suo
+*.user
+
+# ── Secrets / local overrides ─────────────────────────────────
+.env
+.env.local
