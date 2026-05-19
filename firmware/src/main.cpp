@@ -8,6 +8,16 @@
 //
 //  On the PN532 breakout set jumper/switch to I2C mode (SEL0=1, SEL1=0).
 //
+//  RGB LED (WS2812) on GPIO48 shows operational state:
+//    Booting          white dim, solid
+//    Idle / APP mode  blue, slow breathe
+//    Idle / HID mode  green, slow breathe
+//    Tag present      white, solid bright
+//    Reading          cyan, fast blink
+//    Writing          amber, fast blink
+//    Success          green flash (500 ms) → idle
+//    Error            red flash (500 ms) → idle
+//
 //  USB: the device enumerates as composite HID keyboard + CDC serial.
 //  HID types the UID + Tab each scan.  CDC serial is used by the Tauri app.
 //
@@ -25,18 +35,117 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <Adafruit_PN532.h>
+#include <Adafruit_NeoPixel.h>
 #include "USB.h"
 #include "USBHIDKeyboard.h"
 
 #define SDA_PIN    8
 #define SCL_PIN    9
 #define PN532_IRQ  4
+#define LED_PIN    48
 
-Adafruit_PN532 nfc(PN532_IRQ, -1);  // RST tied to 3.3V on breakout
-USBHIDKeyboard Keyboard;
-// Serial = USB CDC (ARDUINO_USB_CDC_ON_BOOT=1 wires it automatically)
+Adafruit_PN532     nfc(PN532_IRQ, -1);
+Adafruit_NeoPixel  led(1, LED_PIN, NEO_GRB + NEO_KHZ800);
+USBHIDKeyboard     Keyboard;
 
-// ───── helpers ──────────────────────────────────────────────────────────────
+// ───── LED state machine ─────────────────────────────────────────────────────
+
+enum LedMode {
+    LED_BOOT,
+    LED_IDLE,       // breathe; color depends on hidEnabled
+    LED_TAG,        // solid white — tag on reader
+    LED_READING,    // cyan fast blink
+    LED_WRITING,    // amber fast blink
+    LED_FLASH_OK,   // green 500 ms flash then back to LED_IDLE / LED_TAG
+    LED_FLASH_ERR,  // red 500 ms flash then back to LED_IDLE / LED_TAG
+};
+
+static LedMode  ledMode      = LED_BOOT;
+static LedMode  ledAfterFlash = LED_IDLE;
+static uint32_t ledTimer     = 0;
+static bool     ledBlinkOn   = false;
+
+// Approximate breathing using a triangle wave on millis()
+static uint8_t breathBrightness() {
+    uint32_t t   = millis() % 3000;        // 3-second cycle
+    uint32_t half = 1500;
+    uint8_t  b   = (t < half) ? (uint8_t)(t * 60 / half)
+                               : (uint8_t)((3000 - t) * 60 / half);
+    return b + 10;                         // floor of 10 so it never fully off
+}
+
+static void ledUpdate() {
+    uint32_t now = millis();
+
+    switch (ledMode) {
+        case LED_BOOT:
+            led.setPixelColor(0, led.Color(20, 20, 20));
+            break;
+
+        case LED_IDLE: {
+            uint8_t b = breathBrightness();
+            // green in HID mode, blue in APP mode
+            extern bool hidEnabled;
+            if (hidEnabled)
+                led.setPixelColor(0, led.Color(0, b, 0));
+            else
+                led.setPixelColor(0, led.Color(0, 0, b));
+            break;
+        }
+
+        case LED_TAG:
+            led.setPixelColor(0, led.Color(60, 60, 60));
+            break;
+
+        case LED_READING:
+            if (now - ledTimer >= 120) {
+                ledTimer   = now;
+                ledBlinkOn = !ledBlinkOn;
+            }
+            led.setPixelColor(0, ledBlinkOn ? led.Color(0, 60, 60) : led.Color(0, 0, 0));
+            break;
+
+        case LED_WRITING:
+            if (now - ledTimer >= 120) {
+                ledTimer   = now;
+                ledBlinkOn = !ledBlinkOn;
+            }
+            led.setPixelColor(0, ledBlinkOn ? led.Color(60, 40, 0) : led.Color(0, 0, 0));
+            break;
+
+        case LED_FLASH_OK:
+            if (now - ledTimer >= 500) {
+                ledMode = ledAfterFlash;
+                return ledUpdate();
+            }
+            led.setPixelColor(0, led.Color(0, 80, 0));
+            break;
+
+        case LED_FLASH_ERR:
+            if (now - ledTimer >= 500) {
+                ledMode = ledAfterFlash;
+                return ledUpdate();
+            }
+            led.setPixelColor(0, led.Color(80, 0, 0));
+            break;
+    }
+
+    led.show();
+}
+
+static void ledSet(LedMode mode) {
+    ledMode    = mode;
+    ledTimer   = millis();
+    ledBlinkOn = true;
+    ledUpdate();
+}
+
+static void ledFlash(bool ok) {
+    ledAfterFlash = (ledMode == LED_TAG) ? LED_TAG : LED_IDLE;
+    ledSet(ok ? LED_FLASH_OK : LED_FLASH_ERR);
+}
+
+// ───── helpers ───────────────────────────────────────────────────────────────
 
 static String bytesToHex(const uint8_t *buf, uint8_t len) {
     String s;
@@ -61,14 +170,13 @@ static bool sameUID(const uint8_t *uid, uint8_t uidLen,
     return memcmp(uid, last, uidLen) == 0;
 }
 
-// ───── tag type ─────────────────────────────────────────────────────────────
+// ───── tag type ──────────────────────────────────────────────────────────────
 
 enum TagType { TAG_UNKNOWN, TAG_MIFARE_CLASSIC, TAG_ULTRALIGHT,
                TAG_NTAG213, TAG_NTAG215, TAG_NTAG216 };
 
 static TagType detectType(uint8_t *uid, uint8_t uidLen) {
     if (uidLen == 4) return TAG_MIFARE_CLASSIC;
-    // Read capability container (page 3) to distinguish NTAG vs Ultralight
     uint8_t cc[4];
     if (!nfc.mifareultralight_ReadPage(3, cc)) return TAG_UNKNOWN;
     switch (cc[2]) {
@@ -100,24 +208,35 @@ static uint8_t pageCount(TagType t) {
     }
 }
 
-// ───── state ────────────────────────────────────────────────────────────────
+// ───── state ─────────────────────────────────────────────────────────────────
 
-static bool     hidEnabled = true;
-static bool     tagPresent = false;
+bool            hidEnabled  = true;
+static bool     tagPresent  = false;
 static uint8_t  lastUID[7];
-static uint8_t  lastUIDLen = 0;
+static uint8_t  lastUIDLen  = 0;
 static TagType  currentType = TAG_UNKNOWN;
 
-// ───── operations ────────────────────────────────────────────────────────────
+// ───── operations ─────────────────────────────────────────────────────────────
 
 static void opReadAll() {
-    if (!tagPresent) { Serial.println(F("{\"event\":\"error\",\"msg\":\"No tag\"}")); return; }
+    if (!tagPresent) {
+        Serial.println(F("{\"event\":\"error\",\"msg\":\"No tag\"}"));
+        ledFlash(false);
+        return;
+    }
     if (currentType == TAG_MIFARE_CLASSIC) {
         Serial.println(F("{\"event\":\"error\",\"msg\":\"Use AUTH+READ_BLOCK for MIFARE Classic\"}"));
+        ledFlash(false);
         return;
     }
     uint8_t pages = pageCount(currentType);
-    if (!pages) { Serial.println(F("{\"event\":\"error\",\"msg\":\"Unknown tag type\"}")); return; }
+    if (!pages) {
+        Serial.println(F("{\"event\":\"error\",\"msg\":\"Unknown tag type\"}"));
+        ledFlash(false);
+        return;
+    }
+
+    ledSet(LED_READING);
 
     Serial.println("{\"event\":\"read_start\",\"pages\":" + String(pages) + "}");
     uint8_t buf[4];
@@ -127,83 +246,113 @@ static void opReadAll() {
                               ",\"data\":\"" + bytesToHex(buf, 4) + "\"}");
         else
             Serial.println("{\"event\":\"page\",\"page\":" + String(p) + ",\"error\":true}");
+        ledUpdate();
     }
     Serial.println(F("{\"event\":\"read_done\"}"));
+    ledSet(LED_TAG);
 }
 
 static void opReadPage(uint8_t page) {
     uint8_t buf[4];
-    if (nfc.mifareultralight_ReadPage(page, buf))
+    if (nfc.mifareultralight_ReadPage(page, buf)) {
         Serial.println("{\"event\":\"page\",\"page\":" + String(page) +
                           ",\"data\":\"" + bytesToHex(buf, 4) + "\"}");
-    else
+        ledFlash(true);
+    } else {
         Serial.println(F("{\"event\":\"error\",\"msg\":\"Read page failed\"}"));
+        ledFlash(false);
+    }
 }
 
 static void opWritePage(uint8_t page, const String &hex) {
     if (page < 4) {
         Serial.println(F("{\"event\":\"error\",\"msg\":\"Pages 0-3 are system pages — write blocked\"}"));
+        ledFlash(false);
         return;
     }
     uint8_t total = pageCount(currentType);
     if (total > 0 && page >= total - 5) {
         Serial.println(F("{\"event\":\"error\",\"msg\":\"Config pages are protected — write blocked\"}"));
+        ledFlash(false);
         return;
     }
     uint8_t data[4];
     if (!hexToBytes(hex, data, 4)) {
         Serial.println(F("{\"event\":\"error\",\"msg\":\"Need exactly 8 hex chars\"}"));
+        ledFlash(false);
         return;
     }
-    if (nfc.ntag2xx_WritePage(page, data))
+
+    ledSet(LED_WRITING);
+
+    if (nfc.ntag2xx_WritePage(page, data)) {
         Serial.println("{\"event\":\"ok\",\"msg\":\"Page written\",\"page\":" + String(page) + "}");
-    else
+        ledFlash(true);
+    } else {
         Serial.println(F("{\"event\":\"error\",\"msg\":\"Write failed\"}"));
+        ledFlash(false);
+    }
 }
 
 static void opAuth(uint8_t sector, uint8_t keyType, const String &keyHex) {
     uint8_t key[6];
     if (!hexToBytes(keyHex, key, 6)) {
         Serial.println(F("{\"event\":\"error\",\"msg\":\"Need exactly 12 hex chars for key\"}"));
+        ledFlash(false);
         return;
     }
     uint8_t block = sector * 4;
-    if (nfc.mifareclassic_AuthenticateBlock(lastUID, lastUIDLen, block, keyType, key))
+    if (nfc.mifareclassic_AuthenticateBlock(lastUID, lastUIDLen, block, keyType, key)) {
         Serial.println("{\"event\":\"ok\",\"msg\":\"Auth ok\",\"sector\":" + String(sector) + "}");
-    else
+        ledFlash(true);
+    } else {
         Serial.println(F("{\"event\":\"error\",\"msg\":\"Auth failed — wrong key?\"}"));
+        ledFlash(false);
+    }
 }
 
 static void opReadBlock(uint8_t block) {
     uint8_t buf[16];
-    if (nfc.mifareclassic_ReadDataBlock(block, buf))
+    if (nfc.mifareclassic_ReadDataBlock(block, buf)) {
         Serial.println("{\"event\":\"block\",\"block\":" + String(block) +
                           ",\"data\":\"" + bytesToHex(buf, 16) + "\"}");
-    else
+        ledFlash(true);
+    } else {
         Serial.println(F("{\"event\":\"error\",\"msg\":\"Read block failed (auth first?)\"}"));
+        ledFlash(false);
+    }
 }
 
 static void opWriteBlock(uint8_t block, const String &hex) {
     if (block == 0) {
         Serial.println(F("{\"event\":\"error\",\"msg\":\"Block 0 is manufacturer data — write blocked\"}"));
+        ledFlash(false);
         return;
     }
     if ((block % 4) == 3) {
         Serial.println(F("{\"event\":\"error\",\"msg\":\"Sector trailer blocks are protected — write blocked\"}"));
+        ledFlash(false);
         return;
     }
     uint8_t data[16];
     if (!hexToBytes(hex, data, 16)) {
         Serial.println(F("{\"event\":\"error\",\"msg\":\"Need exactly 32 hex chars\"}"));
+        ledFlash(false);
         return;
     }
-    if (nfc.mifareclassic_WriteDataBlock(block, data))
+
+    ledSet(LED_WRITING);
+
+    if (nfc.mifareclassic_WriteDataBlock(block, data)) {
         Serial.println("{\"event\":\"ok\",\"msg\":\"Block written\",\"block\":" + String(block) + "}");
-    else
+        ledFlash(true);
+    } else {
         Serial.println(F("{\"event\":\"error\",\"msg\":\"Write failed\"}"));
+        ledFlash(false);
+    }
 }
 
-// ───── command parser ────────────────────────────────────────────────────────
+// ───── command parser ─────────────────────────────────────────────────────────
 
 static void processCommand(String cmd) {
     cmd.trim();
@@ -214,9 +363,11 @@ static void processCommand(String cmd) {
                           String(hidEnabled ? "true" : "false") + "}");
     } else if (cmd == "MODE:HID") {
         hidEnabled = true;
+        ledSet(tagPresent ? LED_TAG : LED_IDLE);
         Serial.println(F("{\"event\":\"ok\",\"mode\":\"hid\"}"));
     } else if (cmd == "MODE:APP") {
         hidEnabled = false;
+        ledSet(tagPresent ? LED_TAG : LED_IDLE);
         Serial.println(F("{\"event\":\"ok\",\"mode\":\"app\"}"));
     } else if (cmd == "READ_ALL") {
         opReadAll();
@@ -224,13 +375,12 @@ static void processCommand(String cmd) {
         opReadPage((uint8_t)cmd.substring(10).toInt());
     } else if (cmd.startsWith("WRITE_PAGE:")) {
         int sep = cmd.indexOf(':', 11);
-        if (sep < 0) { Serial.println(F("{\"event\":\"error\",\"msg\":\"Syntax: WRITE_PAGE:page:hexdata\"}")); return; }
+        if (sep < 0) { Serial.println(F("{\"event\":\"error\",\"msg\":\"Syntax: WRITE_PAGE:page:hexdata\"}")); ledFlash(false); return; }
         opWritePage((uint8_t)cmd.substring(11, sep).toInt(), cmd.substring(sep + 1));
     } else if (cmd.startsWith("AUTH:")) {
-        // AUTH:sector:A/B:hexkey
         int s1 = cmd.indexOf(':', 5);
         int s2 = s1 > 0 ? cmd.indexOf(':', s1 + 1) : -1;
-        if (s1 < 0 || s2 < 0) { Serial.println(F("{\"event\":\"error\",\"msg\":\"Syntax: AUTH:sector:A/B:hexkey\"}")); return; }
+        if (s1 < 0 || s2 < 0) { Serial.println(F("{\"event\":\"error\",\"msg\":\"Syntax: AUTH:sector:A/B:hexkey\"}")); ledFlash(false); return; }
         uint8_t sector  = (uint8_t)cmd.substring(5, s1).toInt();
         uint8_t keyType = (cmd.substring(s1 + 1, s2) == "B") ? 1 : 0;
         opAuth(sector, keyType, cmd.substring(s2 + 1));
@@ -238,19 +388,23 @@ static void processCommand(String cmd) {
         opReadBlock((uint8_t)cmd.substring(11).toInt());
     } else if (cmd.startsWith("WRITE_BLOCK:")) {
         int sep = cmd.indexOf(':', 12);
-        if (sep < 0) { Serial.println(F("{\"event\":\"error\",\"msg\":\"Syntax: WRITE_BLOCK:block:hexdata\"}")); return; }
+        if (sep < 0) { Serial.println(F("{\"event\":\"error\",\"msg\":\"Syntax: WRITE_BLOCK:block:hexdata\"}")); ledFlash(false); return; }
         opWriteBlock((uint8_t)cmd.substring(12, sep).toInt(), cmd.substring(sep + 1));
     } else {
         Serial.println(F("{\"event\":\"error\",\"msg\":\"Unknown command\"}"));
+        ledFlash(false);
     }
 }
 
-// ───── setup / loop ──────────────────────────────────────────────────────────
+// ───── setup / loop ───────────────────────────────────────────────────────────
 
 void setup() {
+    led.begin();
+    led.setBrightness(255);
+    ledSet(LED_BOOT);
+
     Keyboard.begin();
-    USB.begin();   // must be called after all USB class inits
-    // Serial (USB CDC) auto-starts via ARDUINO_USB_CDC_ON_BOOT=1
+    USB.begin();
 
     delay(500);
 
@@ -260,7 +414,11 @@ void setup() {
     uint32_t ver = nfc.getFirmwareVersion();
     if (!ver) {
         Serial.println(F("{\"event\":\"error\",\"msg\":\"PN532 not found — check wiring\"}"));
-        while (true) delay(1000);
+        // Rapid red blink to signal hardware fault
+        while (true) {
+            led.setPixelColor(0, led.Color(80, 0, 0)); led.show(); delay(200);
+            led.setPixelColor(0, led.Color(0,  0, 0)); led.show(); delay(200);
+        }
     }
 
     nfc.SAMConfig();
@@ -269,16 +427,16 @@ void setup() {
     snprintf(buf, sizeof(buf), "{\"event\":\"ready\",\"fw\":\"%d.%d\"}",
              (int)((ver >> 16) & 0xFF), (int)((ver >> 8) & 0xFF));
     Serial.println(buf);
+
+    ledSet(LED_IDLE);
 }
 
 void loop() {
-    // Drain serial commands
     while (Serial.available()) {
         String cmd = Serial.readStringUntil('\n');
         processCommand(cmd);
     }
 
-    // Poll for ISO14443A tag (50 ms timeout keeps loop responsive)
     uint8_t uid[7];
     uint8_t uidLen = 0;
     bool detected = nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLen, 50);
@@ -287,14 +445,14 @@ void loop() {
         if (!tagPresent || !sameUID(uid, uidLen, lastUID, lastUIDLen)) {
             tagPresent = true;
             memcpy(lastUID, uid, uidLen);
-            lastUIDLen = uidLen;
+            lastUIDLen  = uidLen;
             currentType = detectType(uid, uidLen);
 
             String uidStr = bytesToHex(uid, uidLen);
 
             if (hidEnabled) {
                 Keyboard.print(uidStr);
-                Keyboard.print("\t");  // Tab to next cell in Excel
+                Keyboard.print("\t");
             }
 
             String json = "{\"event\":\"tag\",\"uid\":\"" + uidStr +
@@ -305,6 +463,8 @@ void loop() {
                 json += ",\"pages\":" + String(pageCount(currentType));
             json += "}";
             Serial.println(json);
+
+            ledSet(LED_TAG);
         }
     } else {
         if (tagPresent) {
@@ -312,6 +472,9 @@ void loop() {
             lastUIDLen  = 0;
             currentType = TAG_UNKNOWN;
             Serial.println(F("{\"event\":\"tag_removed\"}"));
+            ledSet(LED_IDLE);
         }
     }
+
+    ledUpdate();
 }
