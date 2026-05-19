@@ -1,5 +1,6 @@
 # ── Rust / Tauri ──────────────────────────────────────────────
 app/src-tauri/target/
+app/src-tauri/gen/
 
 # ── Node ──────────────────────────────────────────────────────
 app/node_modules/

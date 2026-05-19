@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git -C C:\\\\Users\\\\jimmy\\\\rfid-tool status)",
+      "Bash(git -C C:\\\\Users\\\\jimmy\\\\rfid-tool log --oneline -5)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(git remote *)",
+      "Bash(git push *)",
+      "Bash(Copy-Item *)"
+    ]
+  }
+}
